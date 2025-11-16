@@ -29,13 +29,20 @@ export default async function CitySlugPage({ params }: CitySlugPageProps) {
   const events =
     eventsFromApi.length > 0 ? eventsFromApi : getFallbackEventsForCity(city);
 
-  const { tonightEvents, laterThisWeekEvents } = splitEventsByDate(events);
+  const {
+    tonightEvents,
+    laterThisWeekEvents,
+    tonightHasMore,
+    laterHasMore
+  } = splitEventsByDate(events, city);
 
   return (
     <CityPage
       city={city}
       tonightEvents={tonightEvents}
       laterThisWeekEvents={laterThisWeekEvents}
+      tonightHasMore={tonightHasMore}
+      laterHasMore={laterHasMore}
       weather={weather}
     />
   );
