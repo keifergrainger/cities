@@ -5,6 +5,7 @@ export interface CityEvent {
   name: string;
   category: string;
   startDateTime: string;
+  startLocalDate: string; // "YYYY-MM-DD" in the city's local timezone
   venueName?: string;
   address?: string;
   area?: string;
@@ -14,17 +15,55 @@ export interface CityEvent {
 export interface SplitEvents {
   tonightEvents: CityEvent[];
   laterThisWeekEvents: CityEvent[];
+  tonightHasMore: boolean;
+  laterHasMore: boolean;
 }
 
 const TM_API_KEY = process.env.TM_API_KEY;
-const TM_BASE_URL =
-  "https://app.ticketmaster.com/discovery/v2/events.json";
+const TM_BASE_URL = "https://app.ticketmaster.com/discovery/v2/events.json";
 
-function toDateKey(date: Date): string {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const d = String(date.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
+/**
+ * Get a Date object that represents the local year/month/day
+ * for the given city (midnight in that local day).
+ */
+export function getCityLocalDate(city: CityConfig, date?: Date): Date {
+  const base = date ?? new Date();
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: city.timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(base);
+
+  const year = Number(parts.find((p) => p.type === "year")?.value);
+  const month = Number(parts.find((p) => p.type === "month")?.value);
+  const day = Number(parts.find((p) => p.type === "day")?.value);
+
+  // This Date represents the LOCAL year/month/day in the city's timezone
+  return new Date(year, month - 1, day);
+}
+
+/**
+ * Normalize any ISO string into a "YYYY-MM-DD" date string
+ * in the given IANA timezone.
+ */
+export function toLocalDateString(
+  dateIso: string,
+  timeZone: string
+): string {
+  const d = new Date(dateIso);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(d);
+
+  const year = parts.find((p) => p.type === "year")!.value;
+  const month = parts.find((p) => p.type === "month")!.value;
+  const day = parts.find((p) => p.type === "day")!.value;
+
+  return `${year}-${month}-${day}`; // e.g. "2025-11-13"
 }
 
 export async function fetchEventsForCity(
@@ -35,13 +74,21 @@ export async function fetchEventsForCity(
     return [];
   }
 
-  const now = new Date();
+  // Use the CITY'S local date as the anchor window
+  const todayLocal = getCityLocalDate(city);
 
   const start = new Date(
-    Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0)
+    Date.UTC(
+      todayLocal.getFullYear(),
+      todayLocal.getMonth(),
+      todayLocal.getDate(),
+      0,
+      0,
+      0
+    )
   );
   const end = new Date(start);
-  end.setDate(start.getDate() + 6);
+  end.setDate(start.getDate() + 6); // 7-day window including today
 
   const startDateTime = start.toISOString().slice(0, 19) + "Z";
   const endDateTime = end.toISOString().slice(0, 19) + "Z";
@@ -71,7 +118,6 @@ export async function fetchEventsForCity(
     }
 
     const json = await res.json();
-
     const rawEvents = json?._embedded?.events ?? [];
     if (!Array.isArray(rawEvents)) return [];
 
@@ -79,9 +125,26 @@ export async function fetchEventsForCity(
       .map((evt: any): CityEvent | null => {
         const id = evt.id;
         const name = evt.name;
-        const startDateTime = evt.dates?.start?.dateTime;
 
-        if (!id || !name || !startDateTime) return null;
+        const tmStart = evt.dates?.start;
+        const tmDateTime: string | undefined = tmStart?.dateTime;
+        const tmLocalDate: string | undefined = tmStart?.localDate;
+
+        if (!id || !name || (!tmDateTime && !tmLocalDate)) return null;
+
+        let startDateTime: string;
+        let startLocalDate: string;
+
+        if (tmDateTime) {
+          // Use Ticketmaster's full ISO and normalize to the city's local date
+          startDateTime = tmDateTime;
+          startLocalDate = toLocalDateString(tmDateTime, city.timeZone);
+        } else {
+          // Only localDate provided – anchor at midday UTC to avoid off-by-one
+          const synthetic = `${tmLocalDate}T12:00:00Z`;
+          startDateTime = synthetic;
+          startLocalDate = toLocalDateString(synthetic, city.timeZone);
+        }
 
         const venue = evt._embedded?.venues?.[0];
         const venueName = venue?.name;
@@ -104,6 +167,7 @@ export async function fetchEventsForCity(
           name,
           category,
           startDateTime,
+          startLocalDate,
           venueName,
           address,
           area,
@@ -112,6 +176,7 @@ export async function fetchEventsForCity(
       })
       .filter(Boolean) as CityEvent[];
 
+    // De-dupe by id
     const unique = new Map<string, CityEvent>();
     for (const e of mapped) {
       if (!unique.has(e.id)) unique.set(e.id, e);
@@ -125,45 +190,67 @@ export async function fetchEventsForCity(
 
     return events;
   } catch (err) {
-    console.error("[events] Error fetching Ticketmaster events", err);
+    console.error("[events] fetchEventsForCity failed:", err);
     return [];
   }
 }
 
-export function splitEventsByDate(events: CityEvent[]): SplitEvents {
-  const now = new Date();
-  const todayKey = toDateKey(now);
+const TONIGHT_LIMIT = 2;
+const LATER_LIMIT = 3;
 
-  const windowEnd = new Date(now);
-  windowEnd.setDate(windowEnd.getDate() + 6);
+export function splitEventsByDate(
+  events: CityEvent[],
+  city: CityConfig
+): SplitEvents {
+  // City-local "today"
+  const todayLocal = getCityLocalDate(city);
+  const todayKey = toLocalDateString(
+    todayLocal.toISOString(),
+    city.timeZone
+  );
 
-  const tonightEvents: CityEvent[] = [];
-  const laterThisWeekEvents: CityEvent[] = [];
+  // City-local end-of-week (today + 6 days)
+  const endOfWeekLocal = new Date(todayLocal);
+  endOfWeekLocal.setDate(endOfWeekLocal.getDate() + 6);
+  const endOfWeekKey = toLocalDateString(
+    endOfWeekLocal.toISOString(),
+    city.timeZone
+  );
 
-  for (const evt of events) {
-    const dt = new Date(evt.startDateTime);
-    if (Number.isNaN(dt.getTime())) continue;
+  const tonightsEventsAll = events.filter(
+    (evt) => evt.startLocalDate === todayKey
+  );
 
-    if (dt < now || dt > windowEnd) continue;
+  const laterThisWeekAll = events.filter(
+    (evt) =>
+      evt.startLocalDate > todayKey && evt.startLocalDate <= endOfWeekKey
+  );
 
-    const key = toDateKey(dt);
-    if (key === todayKey) tonightEvents.push(evt);
-    else laterThisWeekEvents.push(evt);
-  }
+  const tonightEvents = tonightsEventsAll.slice(0, TONIGHT_LIMIT);
+  const laterThisWeekEvents = laterThisWeekAll.slice(0, LATER_LIMIT);
 
-  return { tonightEvents, laterThisWeekEvents };
+  const tonightHasMore = tonightsEventsAll.length > TONIGHT_LIMIT;
+  const laterHasMore = laterThisWeekAll.length > LATER_LIMIT;
+
+  return {
+    tonightEvents,
+    laterThisWeekEvents,
+    tonightHasMore,
+    laterHasMore
+  };
 }
 
 export function getFallbackEventsForCity(city: CityConfig): CityEvent[] {
-  const today = new Date();
-  const tonight = new Date(today);
+  const todayLocal = getCityLocalDate(city);
+
+  const tonight = new Date(todayLocal);
   tonight.setHours(19, 0, 0, 0);
 
-  const saturday = new Date(today);
+  const saturday = new Date(todayLocal);
   saturday.setDate(saturday.getDate() + ((6 - saturday.getDay() + 7) % 7));
   saturday.setHours(9, 0, 0, 0);
 
-  const twoDaysOut = new Date(today);
+  const twoDaysOut = new Date(todayLocal);
   twoDaysOut.setDate(twoDaysOut.getDate() + 2);
   twoDaysOut.setHours(18, 30, 0, 0);
 
@@ -173,6 +260,10 @@ export function getFallbackEventsForCity(city: CityConfig): CityEvent[] {
       name: `${city.shortName || city.cityName} Night Market`,
       category: "Food & drink",
       startDateTime: tonight.toISOString(),
+      startLocalDate: toLocalDateString(
+        tonight.toISOString(),
+        city.timeZone
+      ),
       venueName: "Downtown plaza",
       address: `${city.cityName} · ${city.stateCode}`,
       area: "Downtown",
@@ -183,6 +274,10 @@ export function getFallbackEventsForCity(city: CityConfig): CityEvent[] {
       name: "Community Sunset Hike",
       category: "Outdoors",
       startDateTime: twoDaysOut.toISOString(),
+      startLocalDate: toLocalDateString(
+        twoDaysOut.toISOString(),
+        city.timeZone
+      ),
       venueName: "Local trailhead",
       address: `${city.cityName} · ${city.stateCode}`,
       area: "Foothills",
@@ -193,6 +288,10 @@ export function getFallbackEventsForCity(city: CityConfig): CityEvent[] {
       name: "Weekend Farmers Market",
       category: "Family",
       startDateTime: saturday.toISOString(),
+      startLocalDate: toLocalDateString(
+        saturday.toISOString(),
+        city.timeZone
+      ),
       venueName: "Central park",
       address: `${city.cityName} · ${city.stateCode}`,
       area: "Central",
