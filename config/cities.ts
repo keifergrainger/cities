@@ -18,6 +18,7 @@ export interface CityConfig {
   cityName: string;
   shortName?: string;
   stateCode: string;
+  timeZone: string;
   heroTagline: string;
   heroImageUrl: string;
   coordinates: {
@@ -32,11 +33,12 @@ export interface CityConfig {
 
 export const cities: CityConfig[] = [
   {
-    slug: "saltlake",
+     slug: "saltlake",
     domain: "saltlakeut.com",
     cityName: "Salt Lake City",
     shortName: "Salt Lake",
     stateCode: "UT",
+    timeZone: "America/Denver",
     heroTagline:
       "See what’s happening tonight & who to call when you need help.",
     heroImageUrl:
